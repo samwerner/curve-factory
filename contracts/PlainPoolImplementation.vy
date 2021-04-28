@@ -10,11 +10,6 @@
 
 from vyper.interfaces import ERC20
 
-interface CurveToken:
-    def totalSupply() -> uint256: view
-    def mint(_to: address, _value: uint256) -> bool: nonpayable
-    def burnFrom(_to: address, _value: uint256) -> bool: nonpayable
-
 interface Factory:
     def convert_fees() -> bool: nonpayable
     def fee_receiver(_base_pool: address) -> address: view
@@ -123,13 +118,11 @@ def __init__(
     @param _symbol Token symbol
     @param _coins List of all ERC20 conract addresses of coins
     @param _decimals List of number of decimals in coins
-    @param _pool_token Address of the token representing LP share
     @param _A Amplification coefficient multiplied by n * (n - 1)
     @param _fee Fee to charge for exchanges
     @param _admin Admin address
     """
-    # things break if a token has >18 decimals
-    assert _decimals < 19
+
     # fee must be between 0.04% and 1%
     assert _fee >= 4000000
     assert _fee <= 100000000
@@ -138,6 +131,8 @@ def __init__(
 
     for i in range(N_COINS):
         assert _coins[i] != ZERO_ADDRESS
+        # things break if a token has >18 decimals
+        assert _decimals[i] < 19
         self.rate_multipliers[i] = 10 ** (36 - _decimals[i])
 
     self.coins = _coins
@@ -368,26 +363,24 @@ def calc_token_amount(_amounts: uint256[N_COINS], _is_deposit: bool) -> uint256:
         else:
             balances[i] -= _amounts[i]
     D1: uint256 = self._get_D_mem(rates, balances, amp)
-    token_amount: uint256 = CurveToken(self.lp_token).totalSupply()
     diff: uint256 = 0
     if _is_deposit:
         diff = D1 - D0
     else:
         diff = D0 - D1
-    return diff * token_amount / D0
+    return diff * self.totalSupply / D0
 
 
 @external
 @nonreentrant('lock')
-def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256) -> uint256:
+def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _receiver: address = msg.sender) -> uint256:
     """
     @notice Deposit coins into the pool
     @param _amounts List of amounts of coins to deposit
     @param _min_mint_amount Minimum amount of LP tokens to mint from the deposit
+    @param _receiver Address that owns the minted LP tokens
     @return Amount of LP tokens received by depositing
     """
-    assert not self.is_killed  # dev: is killed
-
     amp: uint256 = self._A()
     old_balances: uint256[N_COINS] = self.balances
     rates: uint256[N_COINS] = self.rate_multipliers
@@ -395,11 +388,10 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256) -> uint
     # Initial invariant
     D0: uint256 = self._get_D_mem(rates, old_balances, amp)
 
-    lp_token: address = self.lp_token
-    token_supply: uint256 = CurveToken(lp_token).totalSupply()
+    total_supply: uint256 = self.totalSupply
     new_balances: uint256[N_COINS] = old_balances
     for i in range(N_COINS):
-        if token_supply == 0:
+        if total_supply == 0:
             assert _amounts[i] > 0  # dev: initial deposit requires all coins
         # balances store amounts of c-tokens
         new_balances[i] += _amounts[i]
@@ -413,7 +405,7 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256) -> uint
     D2: uint256 = D1
     fees: uint256[N_COINS] = empty(uint256[N_COINS])
     mint_amount: uint256 = 0
-    if token_supply > 0:
+    if total_supply > 0:
         # Only account for fees if we are not the first to deposit
         fee: uint256 = self.fee * N_COINS / (4 * (N_COINS - 1))
         for i in range(N_COINS):
@@ -428,7 +420,7 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256) -> uint
             self.balances[i] = new_balance - (fees[i] * ADMIN_FEE / FEE_DENOMINATOR)
             new_balances[i] -= fees[i]
         D2 = self._get_D_mem(rates, new_balances, amp)
-        mint_amount = token_supply * (D2 - D0) / D0
+        mint_amount = total_supply * (D2 - D0) / D0
     else:
         self.balances = new_balances
         mint_amount = D1  # Take the dust if there was any
@@ -453,9 +445,12 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256) -> uint
             # end "safeTransferFrom"
 
     # Mint pool tokens
-    CurveToken(lp_token).mint(msg.sender, mint_amount)
+    total_supply += mint_amount
+    self.balanceOf[_receiver] += mint_amount
+    self.totalSupply = total_supply
+    log Transfer(ZERO_ADDRESS, _receiver, mint_amount)
 
-    log AddLiquidity(msg.sender, _amounts, fees, D1, token_supply + mint_amount)
+    log AddLiquidity(msg.sender, _amounts, fees, D1, total_supply + mint_amount)
 
     return mint_amount
 
@@ -540,8 +535,6 @@ def exchange(i: int128, j: int128, _dx: uint256, _min_dy: uint256) -> uint256:
     @param _min_dy Minimum amount of `j` to receive
     @return Actual amount of `j` received
     """
-    assert not self.is_killed  # dev: is killed
-
     rates: uint256[N_COINS] = self.rate_multipliers
     old_balances: uint256[N_COINS] = self.balances
     xp: uint256[N_COINS] = self._xp_mem(rates, old_balances)
@@ -596,21 +589,20 @@ def exchange(i: int128, j: int128, _dx: uint256, _min_dy: uint256) -> uint256:
 
 @external
 @nonreentrant('lock')
-def remove_liquidity(_amount: uint256, _min_amounts: uint256[N_COINS]) -> uint256[N_COINS]:
+def remove_liquidity(_burn_amount: uint256, _min_amounts: uint256[N_COINS]) -> uint256[N_COINS]:
     """
     @notice Withdraw coins from the pool
     @dev Withdrawal amounts are based on current deposit ratios
-    @param _amount Quantity of LP tokens to burn in the withdrawal
+    @param _burn_amount Quantity of LP tokens to burn in the withdrawal
     @param _min_amounts Minimum amounts of underlying coins to receive
     @return List of amounts of coins that were withdrawn
     """
-    lp_token: address = self.lp_token
-    total_supply: uint256 = CurveToken(lp_token).totalSupply()
+    total_supply: uint256 = self.totalSupply
     amounts: uint256[N_COINS] = empty(uint256[N_COINS])
 
     for i in range(N_COINS):
         old_balance: uint256 = self.balances[i]
-        value: uint256 = old_balance * _amount / total_supply
+        value: uint256 = old_balance * _burn_amount / total_supply
         assert value >= _min_amounts[i], "Withdrawal resulted in fewer coins than expected"
         self.balances[i] = old_balance - value
         amounts[i] = value
@@ -626,9 +618,12 @@ def remove_liquidity(_amount: uint256, _min_amounts: uint256[N_COINS]) -> uint25
         if len(_response) > 0:
             assert convert(_response, bool)
 
-    CurveToken(lp_token).burnFrom(msg.sender, _amount)  # dev: insufficient funds
+    total_supply -= _burn_amount
+    self.balanceOf[msg.sender] -= _burn_amount
+    self.totalSupply = total_supply
+    log Transfer(msg.sender, ZERO_ADDRESS, _burn_amount)
 
-    log RemoveLiquidity(msg.sender, amounts, empty(uint256[N_COINS]), total_supply - _amount)
+    log RemoveLiquidity(msg.sender, amounts, empty(uint256[N_COINS]), total_supply - _burn_amount)
 
     return amounts
 
@@ -642,8 +637,6 @@ def remove_liquidity_imbalance(_amounts: uint256[N_COINS], _max_burn_amount: uin
     @param _max_burn_amount Maximum amount of LP token to burn in the withdrawal
     @return Actual amount of the LP token burned in the withdrawal
     """
-    assert not self.is_killed  # dev: is killed
-
     amp: uint256 = self._A()
     old_balances: uint256[N_COINS] = self.balances
     rates: uint256[N_COINS] = self.rate_multipliers
@@ -669,14 +662,17 @@ def remove_liquidity_imbalance(_amounts: uint256[N_COINS], _max_burn_amount: uin
         new_balances[i] = new_balance - fees[i]
     D2: uint256 = self._get_D_mem(rates, new_balances, amp)
 
-    lp_token: address = self.lp_token
-    token_supply: uint256 = CurveToken(lp_token).totalSupply()
-    token_amount: uint256 = (D0 - D2) * token_supply / D0
-    assert token_amount != 0  # dev: zero tokens burned
-    token_amount += 1  # In case of rounding errors - make it unfavorable for the "attacker"
-    assert token_amount <= _max_burn_amount, "Slippage screwed you"
+    total_supply: uint256 = self.totalSupply
+    burn_amount: uint256 = (D0 - D2) * total_supply / D0
+    assert burn_amount != 0  # dev: zero tokens burned
+    burn_amount += 1  # In case of rounding errors - make it unfavorable for the "attacker"
+    assert burn_amount <= _max_burn_amount, "Slippage screwed you"
 
-    CurveToken(lp_token).burnFrom(msg.sender, token_amount)  # dev: insufficient funds
+    total_supply -= burn_amount
+    self.totalSupply = total_supply
+    self.balanceOf[msg.sender] -= burn_amount
+    log Transfer(msg.sender, ZERO_ADDRESS, burn_amount)
+
     for i in range(N_COINS):
         if _amounts[i] != 0:
             _response: Bytes[32] = raw_call(
@@ -691,9 +687,9 @@ def remove_liquidity_imbalance(_amounts: uint256[N_COINS], _max_burn_amount: uin
             if len(_response) > 0:
                 assert convert(_response, bool)
 
-    log RemoveLiquidityImbalance(msg.sender, _amounts, fees, D1, token_supply - token_amount)
+    log RemoveLiquidityImbalance(msg.sender, _amounts, fees, D1, total_supply - burn_amount)
 
-    return token_amount
+    return burn_amount
 
 
 @pure
@@ -750,10 +746,10 @@ def _calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> (uint256, uint
     # * Get current D
     # * Solve Eqn against y_i for D - _token_amount
     amp: uint256 = self._A()
-    rates: uint256 = self.rate_multipliers
+    rates: uint256[N_COINS] = self.rate_multipliers
     xp: uint256[N_COINS] = self._xp(rates)
     D0: uint256 = self._get_D(xp, amp)
-    total_supply: uint256 = CurveToken(self.lp_token).totalSupply()
+    total_supply: uint256 = self.totalSupply
     D1: uint256 = D0 - _token_amount * D0 / total_supply
     new_y: uint256 = self._get_y_D(amp, i, xp, D1)
     xp_reduced: uint256[N_COINS] = xp
@@ -776,36 +772,37 @@ def _calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> (uint256, uint
 
 @view
 @external
-def calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> uint256:
+def calc_withdraw_one_coin(_burn_amount: uint256, i: int128) -> uint256:
     """
     @notice Calculate the amount received when withdrawing a single coin
-    @param _token_amount Amount of LP tokens to burn in the withdrawal
+    @param _burn_amount Amount of LP tokens to burn in the withdrawal
     @param i Index value of the coin to withdraw
     @return Amount of coin received
     """
-    return self._calc_withdraw_one_coin(_token_amount, i)[0]
+    return self._calc_withdraw_one_coin(_burn_amount, i)[0]
 
 
 @external
 @nonreentrant('lock')
-def remove_liquidity_one_coin(_token_amount: uint256, i: int128, _min_amount: uint256) -> uint256:
+def remove_liquidity_one_coin(_burn_amount: uint256, i: int128, _min_amount: uint256) -> uint256:
     """
     @notice Withdraw a single coin from the pool
-    @param _token_amount Amount of LP tokens to burn in the withdrawal
+    @param _burn_amount Amount of LP tokens to burn in the withdrawal
     @param i Index value of the coin to withdraw
     @param _min_amount Minimum amount of coin to receive
     @return Amount of coin received
     """
-    assert not self.is_killed  # dev: is killed
-
     dy: uint256 = 0
     dy_fee: uint256 = 0
     total_supply: uint256 = 0
-    dy, dy_fee, total_supply = self._calc_withdraw_one_coin(_token_amount, i)
+    dy, dy_fee, total_supply = self._calc_withdraw_one_coin(_burn_amount, i)
     assert dy >= _min_amount, "Not enough coins removed"
 
     self.balances[i] -= (dy + dy_fee * ADMIN_FEE / FEE_DENOMINATOR)
-    CurveToken(self.lp_token).burnFrom(msg.sender, _token_amount)  # dev: insufficient funds
+    total_supply = self.totalSupply - _burn_amount
+    self.totalSupply = total_supply
+    self.balanceOf[msg.sender] -= _burn_amount
+    log Transfer(msg.sender, ZERO_ADDRESS, _burn_amount)
 
     _response: Bytes[32] = raw_call(
         self.coins[i],
@@ -819,7 +816,7 @@ def remove_liquidity_one_coin(_token_amount: uint256, i: int128, _min_amount: ui
     if len(_response) > 0:
         assert convert(_response, bool)
 
-    log RemoveLiquidityOne(msg.sender, _token_amount, dy, total_supply - _token_amount)
+    log RemoveLiquidityOne(msg.sender, _burn_amount, dy, total_supply - _burn_amount)
 
     return dy
 
